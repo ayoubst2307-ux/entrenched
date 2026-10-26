@@ -1,0 +1,540 @@
+repeat task.wait() until game:IsLoaded()
+
+local Cloneref     = cloneref or function(i) return i end
+local Players      = Cloneref(game:GetService("Players"))
+local RunService   = Cloneref(game:GetService("RunService"))
+local UIS          = Cloneref(game:GetService("UserInputService"))
+local TweenService = Cloneref(game:GetService("TweenService"))
+local LocalPlayer  = Players.LocalPlayer
+
+-- ============================================================
+--  CONFIG
+-- ============================================================
+local CFG = {
+    aimbot_enabled   = false,
+    aimbot_fov       = 120,
+    aimbot_smooth    = 0.15,
+    aimbot_key       = Enum.KeyCode.Q,
+    aimbot_part      = "Head",
+    -- Prédiction
+    predict_enabled  = true,
+    predict_factor   = 0.12,  -- 0.05 = peu, 0.2 = agressif
+    -- ESP
+    esp_enabled      = false,
+    esp_max_dist     = 800,
+    -- Highlight cible
+    highlight_enabled= true,
+    -- Speed
+    speed_enabled    = false,
+    speed_value      = 32,
+    jump_enabled     = false,
+    noclip_enabled   = false,
+    menu_key         = Enum.KeyCode.RightShift,
+}
+
+-- ============================================================
+--  VELOCITY TRACKER — pour la prédiction
+--  Stocke la vélocité de chaque character sur les dernières frames
+-- ============================================================
+local vel_cache: {[Player]: Vector3} = {}
+local pos_cache: {[Player]: Vector3} = {}
+
+RunService.Heartbeat:Connect(function()
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LocalPlayer then continue end
+        local char = p.Character; if not char then continue end
+        local root = char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        if not root then continue end
+        local prev = pos_cache[p]
+        if prev then
+            vel_cache[p] = root.Position - prev
+        end
+        pos_cache[p] = root.Position
+    end
+end)
+
+local function get_predicted_pos(p: Player, part: BasePart): Vector3
+    if not CFG.predict_enabled then return part.Position end
+    local vel = vel_cache[p]
+    if not vel then return part.Position end
+    -- calcule la distance caméra → cible pour estimer le temps de vol
+    local cam = workspace.CurrentCamera
+    local dist = (part.Position - cam.CFrame.Position).Magnitude
+    -- plus la cible est loin, plus on prédit loin
+    local frames = (dist / 300) / CFG.predict_factor * 8
+    return part.Position + vel * frames
+end
+
+-- ============================================================
+--  HIGHLIGHT — surligne la cible visée
+-- ============================================================
+local current_highlight: Highlight? = nil
+local current_target: Player? = nil
+
+local function set_highlight(p: Player?)
+    -- retire l'ancien highlight
+    if current_highlight then
+        current_highlight:Destroy()
+        current_highlight = nil
+    end
+    current_target = p
+    if not p then return end
+    local char = p.Character; if not char then return end
+    local h = Instance.new("Highlight")
+    h.FillColor        = Color3.fromRGB(255, 50, 50)
+    h.OutlineColor     = Color3.fromRGB(255, 200, 50)
+    h.FillTransparency = 0.4
+    h.OutlineTransparency = 0
+    h.Adornee          = char
+    h.Parent           = char
+    current_highlight  = h
+end
+
+-- update highlight si le character change
+RunService.Heartbeat:Connect(function()
+    if not current_highlight or not current_target then return end
+    local char = current_target.Character
+    if not char then set_highlight(nil); return end
+    if current_highlight.Adornee ~= char then
+        current_highlight.Adornee = char
+    end
+end)
+
+Players.PlayerRemoving:Connect(function(p)
+    if p == current_target then set_highlight(nil) end
+end)
+
+-- ============================================================
+--  CAMERA
+-- ============================================================
+local Camera = workspace.CurrentCamera
+
+local function screen_center(): Vector2
+    local vp = Camera.ViewportSize
+    return Vector2.new(vp.X/2, vp.Y/2)
+end
+
+local function is_enemy(p: Player): boolean
+    if not LocalPlayer.Team then return true end
+    return p.Team ~= LocalPlayer.Team
+end
+
+-- ============================================================
+--  GET TARGET IN FOV (avec prédiction)
+-- ============================================================
+local function get_target(): (Player?, Vector2?, Vector3?)
+    local center   = screen_center()
+    local best_p: Player?   = nil
+    local best_sp: Vector2? = nil
+    local best_pos: Vector3? = nil
+    local best_d            = CFG.aimbot_fov
+
+    for _, p in ipairs(Players:GetPlayers()) do
+        if p == LocalPlayer then continue end
+        if not is_enemy(p) then continue end
+        local char = p.Character; if not char then continue end
+        local part = char:FindFirstChild(CFG.aimbot_part) :: BasePart?
+        local hum  = char:FindFirstChildOfClass("Humanoid")
+        if not part or not hum or hum.Health <= 0 then continue end
+
+        -- position prédite
+        local pred_pos = get_predicted_pos(p, part)
+        local sp, vis  = Camera:WorldToViewportPoint(pred_pos)
+        if not vis then continue end
+
+        local sp2 = Vector2.new(sp.X, sp.Y)
+        local d   = (sp2 - center).Magnitude
+        if d < best_d then
+            best_d   = d
+            best_p   = p
+            best_sp  = sp2
+            best_pos = pred_pos
+        end
+    end
+    return best_p, best_sp, best_pos
+end
+
+-- ============================================================
+--  GUI — dégradé noir/rouge transparent, sans contour
+-- ============================================================
+local gui = Instance.new("ScreenGui")
+gui.Name           = "59zzrHub"
+gui.ResetOnSpawn   = false
+gui.ZIndexBehavior = Enum.ZIndexBehavior.Sibling
+gui.Parent         = gethui and gethui() or LocalPlayer:WaitForChild("PlayerGui")
+
+local function mk(class, props, parent)
+    local i = Instance.new(class)
+    for k,v in pairs(props) do i[k] = v end
+    i.Parent = parent
+    return i
+end
+
+local function tw(obj, props, t)
+    TweenService:Create(obj, TweenInfo.new(t or 0.2, Enum.EasingStyle.Quad), props):Play()
+end
+
+local Win = mk("Frame", {
+    Size                   = UDim2.fromOffset(360, 0),
+    Position               = UDim2.fromScale(0.5, 0.5),
+    AnchorPoint            = Vector2.new(0.5, 0.5),
+    BackgroundColor3       = Color3.fromRGB(8, 0, 0),
+    BackgroundTransparency = 0.12,
+    BorderSizePixel        = 0,
+    Active                 = true,
+    Draggable              = true,
+    Visible                = true,
+    ClipsDescendants       = true,
+    AutomaticSize          = Enum.AutomaticSize.Y,
+}, gui)
+mk("UICorner", { CornerRadius = UDim.new(0,14) }, Win)
+
+local grad = Instance.new("UIGradient")
+grad.Color = ColorSequence.new({
+    ColorSequenceKeypoint.new(0,   Color3.fromRGB(3,  0,   0)),
+    ColorSequenceKeypoint.new(0.5, Color3.fromRGB(15, 3,   3)),
+    ColorSequenceKeypoint.new(1,   Color3.fromRGB(50, 6,   6)),
+})
+grad.Rotation = 135
+grad.Parent = Win
+
+-- Header
+local Header = mk("Frame", {
+    Size                   = UDim2.new(1,0,0,46),
+    BackgroundColor3       = Color3.fromRGB(0,0,0),
+    BackgroundTransparency = 0.3,
+    BorderSizePixel        = 0,
+}, Win)
+mk("UICorner", { CornerRadius = UDim.new(0,14) }, Header)
+
+mk("TextLabel", {
+    Size                   = UDim2.new(1,-48,1,0),
+    Position               = UDim2.fromOffset(14,0),
+    BackgroundTransparency = 1,
+    Text                   = "59zzr Hub  •  Entrenched",
+    TextColor3             = Color3.fromRGB(255,55,55),
+    TextSize               = 15,
+    Font                   = Enum.Font.GothamBold,
+    TextXAlignment         = Enum.TextXAlignment.Left,
+}, Header)
+
+local CloseBtn = mk("TextButton", {
+    Size                   = UDim2.fromOffset(28,28),
+    Position               = UDim2.new(1,-34,0,9),
+    BackgroundColor3       = Color3.fromRGB(130,15,15),
+    BackgroundTransparency = 0.2,
+    Text                   = "✕",
+    TextColor3             = Color3.fromRGB(255,255,255),
+    TextSize               = 12,
+    Font                   = Enum.Font.GothamBold,
+    BorderSizePixel        = 0,
+}, Header)
+mk("UICorner", { CornerRadius = UDim.new(0,6) }, CloseBtn)
+CloseBtn.MouseButton1Click:Connect(function()
+    tw(Win, { Position = UDim2.fromScale(0.5,1.6) }, 0.25)
+    task.wait(0.3); Win.Visible = false
+end)
+
+mk("TextLabel", {
+    Size                   = UDim2.new(1,0,0,14),
+    Position               = UDim2.fromOffset(0,46),
+    BackgroundTransparency = 1,
+    Text                   = "[ RightShift ] pour rouvrir",
+    TextColor3             = Color3.fromRGB(80,30,30),
+    TextSize               = 9,
+    Font                   = Enum.Font.Gotham,
+}, Win)
+
+local Content = mk("Frame", {
+    Size                   = UDim2.new(1,-16,0,0),
+    Position               = UDim2.fromOffset(8,62),
+    BackgroundTransparency = 1,
+    BorderSizePixel        = 0,
+    AutomaticSize          = Enum.AutomaticSize.Y,
+}, Win)
+mk("UIListLayout", { Padding=UDim.new(0,5) }, Content)
+mk("UIPadding", { PaddingTop=UDim.new(0,4), PaddingBottom=UDim.new(0,8) }, Content)
+
+-- ============================================================
+--  UI HELPERS
+-- ============================================================
+local function section(label: string)
+    mk("TextLabel", {
+        Size                   = UDim2.new(1,0,0,16),
+        BackgroundTransparency = 1,
+        Text                   = label,
+        TextColor3             = Color3.fromRGB(160,35,35),
+        TextSize               = 10,
+        Font                   = Enum.Font.GothamBold,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, Content)
+end
+
+local function toggle(label: string, default: boolean, cb: (boolean)->())
+    local active = default
+    local row = mk("Frame", {
+        Size                   = UDim2.new(1,0,0,34),
+        BackgroundColor3       = Color3.fromRGB(0,0,0),
+        BackgroundTransparency = 0.5,
+        BorderSizePixel        = 0,
+    }, Content)
+    mk("UICorner", { CornerRadius = UDim.new(0,8) }, row)
+    mk("TextLabel", {
+        Size                   = UDim2.new(1,-56,1,0),
+        Position               = UDim2.fromOffset(10,0),
+        BackgroundTransparency = 1,
+        Text                   = label,
+        TextColor3             = Color3.fromRGB(220,200,200),
+        TextSize               = 12,
+        Font                   = Enum.Font.Gotham,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, row)
+    local pill = mk("TextButton", {
+        Size                   = UDim2.fromOffset(44,22),
+        Position               = UDim2.new(1,-50,0.5,-11),
+        BackgroundColor3       = active and Color3.fromRGB(170,18,18) or Color3.fromRGB(28,12,12),
+        BackgroundTransparency = 0.15,
+        Text                   = active and "ON" or "OFF",
+        TextColor3             = Color3.fromRGB(255,220,220),
+        TextSize               = 10,
+        Font                   = Enum.Font.GothamBold,
+        BorderSizePixel        = 0,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, pill)
+    pill.MouseButton1Click:Connect(function()
+        active = not active
+        tw(pill, { BackgroundColor3 = active and Color3.fromRGB(170,18,18) or Color3.fromRGB(28,12,12) })
+        pill.Text = active and "ON" or "OFF"
+        cb(active)
+    end)
+end
+
+local function slider(label: string, min_v: number, max_v: number, default: number, dec: boolean, cb: (number)->())
+    local row = mk("Frame", {
+        Size                   = UDim2.new(1,0,0,50),
+        BackgroundColor3       = Color3.fromRGB(0,0,0),
+        BackgroundTransparency = 0.5,
+        BorderSizePixel        = 0,
+    }, Content)
+    mk("UICorner", { CornerRadius = UDim.new(0,8) }, row)
+    local val_lbl = mk("TextLabel", {
+        Size                   = UDim2.new(1,-12,0,20),
+        Position               = UDim2.fromOffset(10,4),
+        BackgroundTransparency = 1,
+        Text                   = label .. ": " .. (dec and string.format("%.2f",default) or tostring(default)),
+        TextColor3             = Color3.fromRGB(220,200,200),
+        TextSize               = 11,
+        Font                   = Enum.Font.Gotham,
+        TextXAlignment         = Enum.TextXAlignment.Left,
+    }, row)
+    local track = mk("Frame", {
+        Size                   = UDim2.new(1,-20,0,5),
+        Position               = UDim2.fromOffset(10,32),
+        BackgroundColor3       = Color3.fromRGB(35,8,8),
+        BackgroundTransparency = 0.2,
+        BorderSizePixel        = 0,
+    }, row)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, track)
+    local fill = mk("Frame", {
+        Size             = UDim2.new((default-min_v)/(max_v-min_v),0,1,0),
+        BackgroundColor3 = Color3.fromRGB(170,18,18),
+        BorderSizePixel  = 0,
+    }, track)
+    mk("UICorner", { CornerRadius = UDim.new(1,0) }, fill)
+    local drag = false
+    track.InputBegan:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=true end end)
+    UIS.InputEnded:Connect(function(i) if i.UserInputType==Enum.UserInputType.MouseButton1 then drag=false end end)
+    UIS.InputChanged:Connect(function(i)
+        if not drag or i.UserInputType~=Enum.UserInputType.MouseMovement then return end
+        local rel = math.clamp((i.Position.X-track.AbsolutePosition.X)/track.AbsoluteSize.X,0,1)
+        local v   = dec and math.floor((min_v+(max_v-min_v)*rel)*100)/100 or math.floor(min_v+(max_v-min_v)*rel)
+        fill.Size = UDim2.new(rel,0,1,0)
+        val_lbl.Text = label .. ": " .. (dec and string.format("%.2f",v) or tostring(v))
+        cb(v)
+    end)
+end
+
+-- ============================================================
+--  CONTENU MENU
+-- ============================================================
+section("── AIMBOT ──")
+toggle("🎯  Aimbot actif  [ Q ]", false, function(v) CFG.aimbot_enabled=v end)
+toggle("🔮  Prédiction mouvement", true, function(v) CFG.predict_enabled=v end)
+toggle("🔴  Highlight cible", true, function(v) CFG.highlight_enabled=v; if not v then set_highlight(nil) end end)
+toggle("🎯  Viser Head (sinon body)", true, function(v) CFG.aimbot_part=v and "Head" or "HumanoidRootPart" end)
+slider("FOV cercle", 30, 400, 120, false, function(v) CFG.aimbot_fov=v; fov_circle.Radius=v end)
+slider("Smoothness", 0.01, 1.0, 0.15, true, function(v) CFG.aimbot_smooth=v end)
+slider("Prédiction force", 0.01, 0.5, 0.12, true, function(v) CFG.predict_factor=v end)
+
+section("── ESP ──")
+toggle("👁  ESP Ennemis", false, function(v) CFG.esp_enabled=v end)
+slider("Distance max", 100, 2000, 800, false, function(v) CFG.esp_max_dist=v end)
+
+section("── MOUVEMENT ──")
+toggle("⚡  Speed Hack", false, function(v) CFG.speed_enabled=v end)
+slider("Vitesse", 16, 150, 32, false, function(v) CFG.speed_value=v end)
+toggle("🕊  Infinite Jump", false, function(v) CFG.jump_enabled=v end)
+toggle("👻  Noclip", false, function(v) CFG.noclip_enabled=v end)
+
+-- ============================================================
+--  DRAWINGS
+-- ============================================================
+local fov_circle = Drawing.new("Circle")
+fov_circle.Radius=CFG.aimbot_fov; fov_circle.Color=Color3.fromRGB(255,50,50)
+fov_circle.Thickness=1.5; fov_circle.Filled=false; fov_circle.Visible=false
+
+local target_dot = Drawing.new("Circle")
+target_dot.Radius=5; target_dot.Color=Color3.fromRGB(255,220,50)
+target_dot.Filled=true; target_dot.Visible=false
+
+local pred_dot = Drawing.new("Circle")
+pred_dot.Radius=3; pred_dot.Color=Color3.fromRGB(100,180,255)
+pred_dot.Filled=true; pred_dot.Visible=false
+
+-- ============================================================
+--  OPEN MENU
+-- ============================================================
+UIS.InputBegan:Connect(function(i,gpe)
+    if gpe then return end
+    if i.KeyCode==CFG.menu_key then
+        Win.Visible=true
+        Win.Position=UDim2.fromScale(0.5,1.6)
+        tw(Win,{Position=UDim2.fromScale(0.5,0.5)},0.28)
+    end
+end)
+
+-- ============================================================
+--  AIMBOT LOOP
+-- ============================================================
+local aim_held = false
+UIS.InputBegan:Connect(function(i,gpe) if not gpe and i.KeyCode==CFG.aimbot_key then aim_held=true end end)
+UIS.InputEnded:Connect(function(i) if i.KeyCode==CFG.aimbot_key then aim_held=false end end)
+
+RunService.RenderStepped:Connect(function()
+    local center = screen_center()
+    fov_circle.Visible  = CFG.aimbot_enabled
+    fov_circle.Position = center
+
+    if not CFG.aimbot_enabled then
+        target_dot.Visible=false; pred_dot.Visible=false
+        set_highlight(nil)
+        return
+    end
+
+    local best_p, best_sp, best_pos = get_target()
+
+    -- highlight
+    if CFG.highlight_enabled then
+        if best_p ~= current_target then
+            set_highlight(best_p)
+        end
+    else
+        set_highlight(nil)
+    end
+
+    if best_sp and best_pos then
+        -- dot jaune sur position actuelle
+        local raw_sp, raw_vis = Camera:WorldToViewportPoint(
+            best_p and best_p.Character and (best_p.Character:FindFirstChild(CFG.aimbot_part) :: BasePart?) and
+            (best_p.Character:FindFirstChild(CFG.aimbot_part) :: BasePart).Position or best_pos
+        )
+        if raw_vis then
+            target_dot.Position=Vector2.new(raw_sp.X,raw_sp.Y); target_dot.Visible=true
+        end
+
+        -- dot bleu sur position prédite
+        pred_dot.Position=best_sp; pred_dot.Visible=CFG.predict_enabled
+
+        -- smooth aim vers position prédite
+        if aim_held then
+            local cur   = UIS:GetMouseLocation()
+            local delta = (best_sp - cur) * CFG.aimbot_smooth
+            mousemoverel(delta.X, delta.Y)
+        end
+    else
+        target_dot.Visible=false; pred_dot.Visible=false
+        if current_target then set_highlight(nil) end
+    end
+end)
+
+-- ============================================================
+--  ESP
+-- ============================================================
+local esp_cache: {[Player]: {box:any,name:any,hp:any}} = {}
+
+local function esp_add(p: Player)
+    if esp_cache[p] then return end
+    local function sq(f,c) local d=Drawing.new("Square"); d.Thickness=1.5; d.Filled=f; d.Color=c; d.Visible=false; return d end
+    local function tx(s,c) local d=Drawing.new("Text"); d.Size=s; d.Center=true; d.Outline=true; d.Color=c; d.Visible=false; return d end
+    esp_cache[p]={box=sq(false,Color3.fromRGB(255,50,50)),name=tx(12,Color3.fromRGB(255,255,255)),hp=sq(true,Color3.fromRGB(60,255,60))}
+end
+local function esp_hide(p: Player)
+    if not esp_cache[p] then return end
+    for _,d in pairs(esp_cache[p]) do d.Visible=false end
+end
+local function esp_remove(p: Player)
+    if not esp_cache[p] then return end
+    for _,d in pairs(esp_cache[p]) do d:Remove() end
+    esp_cache[p]=nil
+end
+Players.PlayerRemoving:Connect(esp_remove)
+
+RunService.RenderStepped:Connect(function()
+    for _,p in ipairs(Players:GetPlayers()) do
+        if p==LocalPlayer then continue end
+        if not is_enemy(p) then continue end
+        local char=p.Character; if not char then esp_hide(p); continue end
+        local root=char:FindFirstChild("HumanoidRootPart") :: BasePart?
+        local hum=char:FindFirstChildOfClass("Humanoid")
+        if not root or not hum then esp_hide(p); continue end
+        if not CFG.esp_enabled then esp_hide(p); continue end
+        local dist=(root.Position-Camera.CFrame.Position).Magnitude
+        if dist>CFG.esp_max_dist then esp_hide(p); continue end
+        esp_add(p)
+        local ds=esp_cache[p]
+        local sp,vis=Camera:WorldToViewportPoint(root.Position)
+        if not vis then esp_hide(p); continue end
+        local scale=1600/dist; local bw,bh=scale*1.0,scale*1.8
+        -- box rouge si cible aimbot, blanc sinon
+        ds.box.Color = (p==current_target) and Color3.fromRGB(255,220,50) or Color3.fromRGB(255,50,50)
+        ds.box.Size=Vector2.new(bw,bh); ds.box.Position=Vector2.new(sp.X-bw/2,sp.Y-bh/2); ds.box.Visible=true
+        ds.name.Text=p.DisplayName.."  "..math.floor(dist).."m"; ds.name.Position=Vector2.new(sp.X,sp.Y-bh/2-14); ds.name.Visible=true
+        local ratio=math.clamp(hum.Health/math.max(hum.MaxHealth,1),0,1)
+        ds.hp.Color=Color3.fromRGB(math.floor((1-ratio)*255),math.floor(ratio*200),50)
+        ds.hp.Size=Vector2.new(3,bh*ratio); ds.hp.Position=Vector2.new(sp.X-bw/2-7,sp.Y-bh/2+bh*(1-ratio)); ds.hp.Visible=true
+    end
+end)
+
+-- ============================================================
+--  SPEED
+-- ============================================================
+local cur_speed=16
+RunService.Heartbeat:Connect(function()
+    local char=LocalPlayer.Character; if not char then return end
+    local hum=char:FindFirstChildOfClass("Humanoid"); if not hum then return end
+    cur_speed=cur_speed+(((CFG.speed_enabled and CFG.speed_value or 16))-cur_speed)*0.08
+    hum.WalkSpeed=cur_speed
+end)
+
+-- ============================================================
+--  INFINITE JUMP
+-- ============================================================
+UIS.JumpRequest:Connect(function()
+    if not CFG.jump_enabled then return end
+    local char=LocalPlayer.Character; if not char then return end
+    local hum=char:FindFirstChildOfClass("Humanoid")
+    if hum then hum:ChangeState(Enum.HumanoidStateType.Jumping) end
+end)
+
+-- ============================================================
+--  NOCLIP
+-- ============================================================
+RunService.Stepped:Connect(function()
+    if not CFG.noclip_enabled then return end
+    local char=LocalPlayer.Character; if not char then return end
+    for _,p in ipairs(char:GetDescendants()) do
+        if p:IsA("BasePart") then p.CanCollide=false end
+    end
+end)
+
+print("[59zzr Hub] Entrenched v2 loaded")
